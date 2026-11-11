@@ -140,7 +140,8 @@ jobs:
                   bar = candles[i]
                   closed_this_bar = False
 
-                  if position is None and           i>last_exit_bar=-1
+if position is None and i>last_exit_bar=+1:     
+
                       ma20, ma50, rsi, atr = (
                           calculate_indicators(
                               candles, i - 1
