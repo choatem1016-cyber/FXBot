@@ -13,76 +13,283 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Retrieve historical Forex candles
+      - name: Run FXBot historical simulation
         env:
           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        shell: bash
         run: |
           python - <<'PY'
           import os
           import json
           import urllib.request
           import urllib.parse
-          import urllib.error
 
-          token = os.environ.get("OANDA_API_KEY")
+          BASE = "https://api-fxpractice.oanda.com"
+          TOKEN = os.environ["OANDA_API_KEY"]
 
-          if not token:
-              raise SystemExit("Missing OANDA API key")
+          # Estimated round-trip cost in pips.
+          COST_PIPS = 2.0
+          PIP_SIZE = 0.0001
 
-          base = "https://api-fxpractice.oanda.com"
-
-          for pair in ("EUR_USD", "GBP_USD"):
-              query = urllib.parse.urlencode({
-                  "granularity": "H1",
+          def candles_for(pair):
+              params = urllib.parse.urlencode({
                   "count": 500,
+                  "granularity": "H1",
                   "price": "M"
               })
-
               url = (
-                  base + "/v3/instruments/"
-                  + pair + "/candles?" + query
+                  f"{BASE}/v3/instruments/"
+                  f"{pair}/candles?{params}"
               )
-
               request = urllib.request.Request(
                   url,
                   headers={
-                      "Authorization": "Bearer " + token
-                  },
-                  method="GET"
+                      "Authorization": f"Bearer {TOKEN}"
+                  }
               )
+              with urllib.request.urlopen(
+                  request, timeout=30
+              ) as response:
+                  data = json.load(response)
 
-              try:
-                  with urllib.request.urlopen(
-                      request, timeout=20
-                  ) as response:
-                      data = json.load(response)
+              return [
+                  {
+                      "time": c["time"],
+                      "open": float(c["mid"]["o"]),
+                      "high": float(c["mid"]["h"]),
+                      "low": float(c["mid"]["l"]),
+                      "close": float(c["mid"]["c"])
+                  }
+                  for c in data["candles"]
+                  if c["complete"]
+              ]
 
-                  candles = [
-                      c for c in data["candles"]
-                      if c.get("complete")
-                  ]
+          def calculate_indicators(candles, index):
+              closes = [
+                  c["close"]
+                  for c in candles[:index + 1]
+              ]
 
-                  if len(candles) < 100:
-                      raise ValueError(
-                          "Insufficient historical candles"
+              ma20 = sum(closes[-20:]) / 20
+              ma50 = sum(closes[-50:]) / 50
+
+              changes = [
+                  closes[j] - closes[j-1]
+                  for j in range(1, len(closes))
+              ]
+
+              gains = [max(x, 0) for x in changes]
+              losses = [max(-x, 0) for x in changes]
+
+              avg_gain = sum(gains[:14]) / 14
+              avg_loss = sum(losses[:14]) / 14
+
+              for j in range(14, len(changes)):
+                  avg_gain = (
+                      avg_gain * 13 + gains[j]
+                  ) / 14
+                  avg_loss = (
+                      avg_loss * 13 + losses[j]
+                  ) / 14
+
+              if avg_gain == 0 and avg_loss == 0:
+                  rsi = 50
+              elif avg_loss == 0:
+                  rsi = 100
+              else:
+                  rs = avg_gain / avg_loss
+                  rsi = 100 - 100 / (1 + rs)
+
+              ranges = []
+              for j in range(1, index + 1):
+                  current = candles[j]
+                  previous = candles[j-1]
+                  tr = max(
+                      current["high"] - current["low"],
+                      abs(
+                          current["high"] -
+                          previous["close"]
+                      ),
+                      abs(
+                          current["low"] -
+                          previous["close"]
+                      )
+                  )
+                  ranges.append(tr)
+
+              atr = sum(ranges[:14]) / 14
+              for tr in ranges[14:]:
+                  atr = (atr * 13 + tr) / 14
+
+              return ma20, ma50, rsi, atr
+
+          def run_backtest(pair):
+              candles = candles_for(pair)
+
+              if len(candles) < 100:
+                  raise ValueError(
+                      "Not enough historical candles"
+                  )
+
+              trades = []
+              position = None
+
+              # Indicators use the previous
+              # completed candle only.
+              for i in range(60, len(candles)):
+                  bar = candles[i]
+                  closed_this_bar = False
+
+                  if position is None:
+                      ma20, ma50, rsi, atr = (
+                          calculate_indicators(
+                              candles, i - 1
+                          )
                       )
 
-                  closes = [
-                      float(c["mid"]["c"])
-                      for c in candles
-                  ]
+                      direction = None
 
-                  print("PAIR:", pair)
-                  print("Completed candles:", len(candles))
-                  print("First:", candles[0]["time"])
-                  print("Last:", candles[-1]["time"])
-                  print("First close:", closes[0])
-                  print("Last close:", closes[-1])
-                  print("Historical data loaded")
-                  print("NO TRADES PLACED")
-                  print("--------------------")
+                      if atr >= 0.0005:
+                          if (
+                              ma20 > ma50
+                              and 50 <= rsi <= 70
+                          ):
+                              direction = "BUY"
+                          elif (
+                              ma20 < ma50
+                              and 30 <= rsi <= 50
+                          ):
+                              direction = "SELL"
 
-              except urllib.error.HTTPError as error:
-                  print("OANDA API error:", error.code)
-                  raise SystemExit(1)
+                      if direction:
+                          entry = bar["open"]
+                          risk = atr * 1.5
+
+                          if direction == "BUY":
+                              stop = entry - risk
+                              target = entry + risk * 2
+                          else:
+                              stop = entry + risk
+                              target = entry - risk * 2
+
+                          position = {
+                              "direction": direction,
+                              "entry": entry,
+                              "stop": stop,
+                              "target": target
+                          }
+
+                  # Evaluate this candle only
+                  # after the position exists.
+                  if position is not None:
+                      p = position
+                      direction = p["direction"]
+                      exit_price = None
+
+                      if direction == "BUY":
+                          # Adverse opening gaps
+                          # receive the opening price.
+                          if bar["open"] <= p["stop"]:
+                              exit_price = bar["open"]
+                          elif bar["open"] >= p["target"]:
+                              exit_price = p["target"]
+                          elif bar["low"] <= p["stop"]:
+                              exit_price = p["stop"]
+                          elif bar["high"] >= p["target"]:
+                              exit_price = p["target"]
+                      else:
+                          if bar["open"] >= p["stop"]:
+                              exit_price = bar["open"]
+                          elif bar["open"] <= p["target"]:
+                              exit_price = p["target"]
+                          elif bar["high"] >= p["stop"]:
+                              exit_price = p["stop"]
+                          elif bar["low"] <= p["target"]:
+                              exit_price = p["target"]
+
+                      # Stop is prioritized when
+                      # both levels occur in a bar.
+                      if exit_price is not None:
+                          multiplier = (
+                              1 if direction == "BUY"
+                              else -1
+                          )
+                          gross_pips = (
+                              (exit_price - p["entry"])
+                              * multiplier / PIP_SIZE
+                          )
+                          net_pips = (
+                              gross_pips - COST_PIPS
+                          )
+                          trades.append(net_pips)
+                          position = None
+                          closed_this_bar = True
+
+              wins = sum(
+                  result > 0 for result in trades
+              )
+              losses = sum(
+                  result <= 0 for result in trades
+              )
+              total = len(trades)
+              net_pips = sum(trades)
+
+              win_rate = (
+                  wins / total * 100
+                  if total else 0
+              )
+
+              equity = 0
+              peak = 0
+              drawdown = 0
+
+              for result in trades:
+                  equity += result
+                  peak = max(peak, equity)
+                  drawdown = max(
+                      drawdown, peak - equity
+                  )
+
+              print()
+              print("=" * 42)
+              print("FXBOT HISTORICAL BACKTEST")
+              print("PAIR:", pair)
+              print("TIMEFRAME: H1")
+              print("HISTORICAL CANDLES:", len(candles))
+              print("FIRST:", candles[0]["time"])
+              print("LAST:", candles[-1]["time"])
+              print("-" * 42)
+              print("CLOSED TRADES:", total)
+              print("WINNING TRADES:", wins)
+              print("LOSING TRADES:", losses)
+              print(
+                  "WIN RATE:",
+                  f"{win_rate:.2f}%"
+              )
+              print(
+                  "NET PIPS:",
+                  f"{net_pips:.2f}"
+              )
+              print(
+                  "MAX CLOSED-TRADE DRAWDOWN:",
+                  f"{drawdown:.2f} pips"
+              )
+              print(
+                  "ESTIMATED COST:",
+                  f"{COST_PIPS:.1f} pips/trade"
+              )
+              print(
+                  "OPEN POSITION EXCLUDED:",
+                  position is not None
+              )
+              print("ANALYSIS ONLY - NO ORDERS")
+              print("=" * 42)
+
+          for pair in ["EUR_USD", "GBP_USD"]:
+              run_backtest(pair)
+
+          print()
+          print("FXBot backtesting completed.")
+          print("No trades were placed.")
           PY
+
