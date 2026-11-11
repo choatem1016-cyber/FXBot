@@ -120,6 +120,23 @@ jobs:
               else:
                   trend = "SIDEWAYS"
 
+              # Experimental signal rules
+              atr_pips = atr * 10000
+
+              if atr_pips < 5:
+                  signal = "WAIT"
+                  reason = "Low volatility"
+              elif ma20 > ma50 and 50 <= rsi <= 70:
+                  signal = "POTENTIAL BUY"
+                  reason = "Uptrend with positive momentum"
+              elif ma20 < ma50 and 30 <= rsi <= 50:
+                  signal = "POTENTIAL SELL"
+                  reason = "Downtrend with negative momentum"
+              else:
+                  signal = "WAIT"
+                  reason = "Conditions not aligned"
+
+
               print("PAIR:", pair)
               print("Last closed candle:",
                     candles[-1]["time"])
@@ -129,6 +146,10 @@ jobs:
               print("RSI14:", round(rsi, 2))
               print("ATR14:", round(atr, 5))
               print("Trend:", trend)
+
+              print("Signal:", signal)
+              print("Reason:", reason)
+
               print("ANALYSIS ONLY - NO ORDERS")
               print("--------------------")
 
