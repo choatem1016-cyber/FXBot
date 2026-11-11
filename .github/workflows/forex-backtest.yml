@@ -133,14 +133,14 @@ jobs:
 
               trades = []
               position = None
-
+              last_exit_bar = -1
               # Indicators use the previous
               # completed candle only.
               for i in range(60, len(candles)):
                   bar = candles[i]
                   closed_this_bar = False
 
-                  if position is None:
+                  if position is None and           i>last_exit_bar=-1
                       ma20, ma50, rsi, atr = (
                           calculate_indicators(
                               candles, i - 1
@@ -223,7 +223,8 @@ jobs:
                           )
                           trades.append(net_pips)
                           position = None
-                          closed_this_bar = True
+                          last_exit_bar=i 
+                      closed_this_bar=True
 
               wins = sum(
                   result > 0 for result in trades
