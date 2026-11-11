@@ -1,0 +1,88 @@
+
+name: Forex Historical Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Retrieve historical Forex candles
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          import urllib.error
+
+          token = os.environ.get("OANDA_API_KEY")
+
+          if not token:
+              raise SystemExit("Missing OANDA API key")
+
+          base = "https://api-fxpractice.oanda.com"
+
+          for pair in ("EUR_USD", "GBP_USD"):
+              query = urllib.parse.urlencode({
+                  "granularity": "H1",
+                  "count": 500,
+                  "price": "M"
+              })
+
+              url = (
+                  base + "/v3/instruments/"
+                  + pair + "/candles?" + query
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token
+                  },
+                  method="GET"
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=20
+                  ) as response:
+                      data = json.load(response)
+
+                  candles = [
+                      c for c in data["candles"]
+                      if c.get("complete")
+                  ]
+
+                  if len(candles) < 100:
+                      raise ValueError(
+                          "Insufficient historical candles"
+                      )
+
+                  closes = [
+                      float(c["mid"]["c"])
+                      for c in candles
+                  ]
+
+                  print("PAIR:", pair)
+                  print("Completed candles:", len(candles))
+                  print("First:", candles[0]["time"])
+                  print("Last:", candles[-1]["time"])
+                  print("First close:", closes[0])
+                  print("Last close:", closes[-1])
+                  print("Historical data loaded")
+                  print("NO TRADES PLACED")
+                  print("--------------------")
+
+              except urllib.error.HTTPError as error:
+                  print("OANDA API error:", error.code)
+                  raise SystemExit(1)
+          PY
