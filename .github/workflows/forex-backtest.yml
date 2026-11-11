@@ -13,9 +13,9 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Run FXBot historical simulation
+   - name: Run FXBot historical simulation
         env:
-          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         shell: bash
         run: |
           python - <<'PY'
