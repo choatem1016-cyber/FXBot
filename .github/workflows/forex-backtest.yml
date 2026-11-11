@@ -33,7 +33,7 @@ jobs:
 
           def candles_for(pair):
               params = urllib.parse.urlencode({
-                  "count": 500,
+                  "count": 5000,
                   "granularity": "H1",
                   "price": "M"
               })
