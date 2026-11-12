@@ -10,7 +10,7 @@ permissions:
 jobs:
   compare-strategies:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout FXBot
@@ -35,12 +35,13 @@ jobs:
             "v20==3.0.25.0"
           python -m pip install ./tpqoa
 
-      - name: Compare original FXBot strategies
+      - name: Compare FXBot strategies
         env:
           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         run: |
           python - <<'PY'
           import os
+          import time
           import numpy as np
           import pandas as pd
           import v20
@@ -53,8 +54,8 @@ jobs:
           api = v20.Context(
               hostname="api-fxpractice.oanda.com",
               port=443,
-              token=os.environ["OANDA_API_KEY"]
-poll_timeout=30
+              token=os.environ["OANDA_API_KEY"],
+              poll_timeout=30
           )
 
           start = pd.Timestamp("2023-01-01", tz="UTC")
@@ -63,7 +64,7 @@ poll_timeout=30
           candles_data = []
           cursor = start
 
-          print("Downloading EUR/USD historical candles...")
+          print("Downloading EUR/USD historical data...")
 
           while cursor < end:
               batch_end = min(
@@ -71,18 +72,32 @@ poll_timeout=30
                   end
               )
 
-              response = api.instrument.candles(
-                  "EUR_USD",
-                  granularity="H1",
-                  price="M",
-                  fromTime=cursor.isoformat(),
-                  toTime=batch_end.isoformat()
-              )
+              for attempt in range(1, 6):
+                  try:
+                      response = api.instrument.candles(
+                          "EUR_USD",
+                          granularity="H1",
+                          price="M",
+                          fromTime=cursor.isoformat(),
+                          toTime=batch_end.isoformat()
+                      )
 
-              if response.status != 200:
-                  raise RuntimeError(
-                      f"OANDA status: {response.status}"
-                  )
+                      if response.status != 200:
+                          raise RuntimeError(
+                              f"OANDA status {response.status}"
+                          )
+
+                      break
+
+                  except v20.errors.V20Timeout:
+                      if attempt == 5:
+                          raise
+                      print(
+                          f"Timeout. Retrying batch "
+                          f"{cursor.date()} "
+                          f"(attempt {attempt}/5)"
+                      )
+                      time.sleep(attempt * 2)
 
               candles = response.body.get("candles", [])
 
@@ -96,6 +111,16 @@ poll_timeout=30
                       candles_data.append(
                           (timestamp, float(candle.mid.c))
                       )
+
+              print(
+                  "Downloaded:",
+                  cursor.date(),
+                  "to",
+                  batch_end.date(),
+                  "-",
+                  len(candles),
+                  "candles"
+              )
 
               cursor = batch_end
 
@@ -116,36 +141,15 @@ poll_timeout=30
           )
 
           prices["returns"] = np.log(
-              prices["price"] /
-              prices["price"].shift(1)
+              prices["price"] / prices["price"].shift(1)
           )
 
           print("Total candles:", len(prices))
           print("First candle:", prices.index.min())
           print("Last candle:", prices.index.max())
 
-          # Approximate trading cost per unit
-          # of position change, in log-return terms.
           trading_cost = 0.0002
 
-          class SafeSMA(SMABacktest):
-              def acquire_data(self):
-                  return self.input_prices.copy()
-
-          class SafeBollinger(BollingerBandsBacktest):
-              def acquire_data(self):
-                  return self.input_prices.copy()
-
-          class SafeMomentum(MomentumBacktest):
-              def acquire_data(self):
-                  return self.input_prices.copy()
-
-          class SafeContrarian(ContrarianBacktest):
-              def acquire_data(self):
-                  return self.input_prices.copy()
-
-          # Provide each subclass its own input data
-          # before the original initializer runs.
           def make_safe_class(original_class):
               class Safe(original_class):
                   input_prices = None
@@ -181,8 +185,6 @@ poll_timeout=30
           summary = []
 
           for year in [2023, 2024, 2025]:
-              # Use prior candles for indicator
-              # warm-up without counting their returns.
               year_start = pd.Timestamp(
                   f"{year}-01-01", tz="UTC"
               )
@@ -199,11 +201,6 @@ poll_timeout=30
                   (prices.index < year_end)
               ].copy()
 
-              if year_prices.empty:
-                  raise RuntimeError(
-                      f"No prices for {year}"
-                  )
-
               for name, cls, parameters in strategies:
                   cls.input_prices = year_prices
 
@@ -219,7 +216,6 @@ poll_timeout=30
                   tester.test(mute=True)
                   results = tester.get_results()
 
-                  # Report only the requested year.
                   r = results.loc[
                       (results.index >= year_start) &
                       (results.index < year_end)
@@ -227,26 +223,24 @@ poll_timeout=30
 
                   if r.empty:
                       raise RuntimeError(
-                          f"No results: {name}, {year}"
+                          f"No results for {name} in {year}"
                       )
 
-                  # Sum period log returns so each
-                  # year's performance resets correctly.
-                  log_returns = r["strategy"].sum()
                   strategy_return = (
-                      np.exp(log_returns) - 1
+                      np.exp(r["strategy"].sum()) - 1
                   ) * 100
 
                   equity = np.exp(
                       r["strategy"].cumsum()
                   )
-                  peak = equity.cummax()
-                  drawdown = (
-                      equity / peak - 1
-                  ) * 100
 
-                  max_drawdown = drawdown.min()
-                  position_changes = r["trades"].sum()
+                  max_drawdown = (
+                      equity / equity.cummax() - 1
+                  ).min() * 100
+
+                  position_units = int(
+                      r["trades"].sum()
+                  )
 
                   summary.append({
                       "Year": year,
@@ -257,26 +251,23 @@ poll_timeout=30
                       "Max DD %": round(
                           max_drawdown, 2
                       ),
-                      "Position Units": int(
-                          position_changes
-                      )
+                      "Position Units": position_units
                   })
 
           report = pd.DataFrame(summary)
 
           print()
-          print("=" * 75)
-          print("FXBOT ORIGINAL STRATEGY COMPARISON")
-          print("=" * 75)
+          print("=" * 70)
+          print("FXBOT STRATEGY COMPARISON")
+          print("=" * 70)
           print("Pair: EUR/USD")
           print("Timeframe: H1")
           print("Years: 2023, 2024, 2025")
-          print("Cost per position unit:", trading_cost)
+          print("Trading cost per position unit:", trading_cost)
           print()
           print(report.to_string(index=False))
           print()
-          print("IMPORTANT:")
-          print("Returns are historical estimates.")
+          print("Historical backtesting only.")
           print("Trading costs are approximate.")
           print("No leverage or position sizing modeled.")
           print("NO TRADING ORDERS PLACED")
