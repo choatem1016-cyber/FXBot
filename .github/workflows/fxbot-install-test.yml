@@ -1,0 +1,83 @@
+
+name: FXBot Original Installation Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installation-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout FXBot with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Check original files
+        run: |
+          echo "Checking FXBot files"
+
+          test -f main.py
+          test -f requirements.txt
+          test -f .gitmodules
+
+          echo "Original FXBot files found"
+
+          echo "Checking tpqoa submodule"
+
+          git submodule status
+
+          test -f tpqoa/tpqoa.py
+
+          echo "tpqoa submodule found"
+
+      - name: Install compatible test dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            "numpy>=1.23,<2" \
+            "pandas>=1.5,<3" \
+            "matplotlib>=3.6,<4" \
+            "scikit-learn>=1.2,<2" \
+            "pytz>=2022" \
+            "yfinance>=0.2,<1" \
+            "v20==3.0.25.0"
+
+      - name: Install original OANDA library
+        run: |
+          python -m pip install ./tpqoa
+
+      - name: Verify Python imports
+        run: |
+          python - <<'PY'
+          import numpy
+          import pandas
+          import matplotlib
+          import sklearn
+          import pytz
+          import v20
+          import tpqoa
+
+          print("Core dependencies imported")
+
+          from backtesting.SMABacktest import SMABacktest
+          from backtesting.BollingerBandsBacktest import BollingerBandsBacktest
+          from backtesting.ContrarianBacktest import ContrarianBacktest
+          from backtesting.MomentumBacktest import MomentumBacktest
+          from backtesting.MLClassificationBacktest import MLClassificationBacktest
+
+          print("Original backtesting modules imported")
+          print("FXBot installation test passed")
+          print("NO TRADING ORDERS WERE PLACED")
+          PY
