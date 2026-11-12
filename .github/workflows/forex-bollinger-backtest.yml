@@ -1,0 +1,164 @@
+
+name: FXBot Bollinger Bands Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bollinger-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout FXBot
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "numpy>=1.23,<2" \
+            "pandas>=1.5,<3" \
+            "matplotlib>=3.6,<4" \
+            "scikit-learn>=1.2,<2" \
+            "pytz>=2022" \
+            "v20==3.0.25.0"
+          python -m pip install ./tpqoa
+
+      - name: Run original Bollinger Bands backtest
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import numpy as np
+          import pandas as pd
+          import v20
+
+          from backtesting.BollingerBandsBacktest import BollingerBandsBacktest
+
+          token = os.environ["OANDA_API_KEY"]
+
+          # Historical prices only; no order endpoints.
+          api = v20.Context(
+              hostname="api-fxpractice.oanda.com",
+              port=443,
+              token=token
+          )
+
+          all_candles = []
+          start = pd.Timestamp("2025-01-01", tz="UTC")
+          end = pd.Timestamp("2026-01-01", tz="UTC")
+
+          cursor = start
+
+          while cursor < end:
+              response = api.instrument.candles(
+                  "EUR_USD",
+                  granularity="H1",
+                  price="M",
+                  count=5000,
+                  **{"from": cursor.isoformat()}
+              )
+
+              if response.status != 200:
+                  raise RuntimeError(
+                      f"Historical data request failed: {response.status}"
+                  )
+
+              candles = response.get("candles", [])
+              if not candles:
+                  break
+
+              last_time = None
+
+              for candle in candles:
+                  time = pd.Timestamp(candle.time)
+
+                  if time >= end:
+                      break
+
+                  if time >= start and candle.complete:
+                      all_candles.append(
+                          (time, float(candle.mid.c))
+                      )
+
+                  last_time = time
+
+              if last_time is None or last_time <= cursor:
+                  break
+
+              cursor = last_time + pd.Timedelta(seconds=1)
+
+          if not all_candles:
+              raise RuntimeError("No historical candles downloaded")
+
+          df = pd.DataFrame(
+              all_candles,
+              columns=["time", "price"]
+          )
+
+          df = (
+              df.drop_duplicates("time")
+                .set_index("time")
+                .sort_index()
+          )
+
+          df["returns"] = np.log(
+              df["price"] / df["price"].shift(1)
+          )
+
+          # Reuse the creator's original strategy.
+          # Override only its data-download method.
+          class SafeBollingerBacktest(BollingerBandsBacktest):
+              def acquire_data(self):
+                  return df.copy()
+
+          tester = SafeBollingerBacktest(
+              instrument="EUR_USD",
+              start="2025-01-01",
+              end="2026-01-01",
+              sma=20,
+              deviation=2,
+              granularity="H1",
+              trading_cost=0.0002
+          )
+
+          performance, comparison = tester.test()
+          results = tester.get_results()
+
+          position_changes = results["trades"].sum()
+
+          print()
+          print("===================================")
+          print("FXBOT ORIGINAL BOLLINGER BACKTEST")
+          print("===================================")
+          print("Pair: EUR/USD")
+          print("Period: 2025")
+          print("Timeframe: H1")
+          print("SMA: 20")
+          print("Deviation: 2")
+          print("Candles:", len(df))
+          print("Position changes:", position_changes)
+          print(
+              "Strategy return:",
+              round((performance - 1) * 100, 2),
+              "%"
+          )
+          print(
+              "Difference vs buy-and-hold:",
+              round(comparison * 100, 2),
+              "percentage points"
+          )
+          print("NO ORDERS PLACED")
+          PY
