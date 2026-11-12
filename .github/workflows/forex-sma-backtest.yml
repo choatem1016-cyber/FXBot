@@ -1,0 +1,233 @@
+
+name: Forex SMA Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sma-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Run SMA historical comparison
+        shell: bash
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          BASE = "https://api-fxpractice.oanda.com"
+          PIP = 0.0001
+          COST_PIPS = 2.0
+          PAIRS = ("EUR_USD", "GBP_USD")
+          SMA_SETTINGS = (
+              (10, 30),
+              (20, 50),
+              (50, 200),
+          )
+
+          def fetch_candles(pair):
+              params = urllib.parse.urlencode({
+                  "granularity": "H1",
+                  "count": 5000,
+                  "price": "M",
+              })
+              url = (
+                  f"{BASE}/v3/instruments/"
+                  f"{pair}/candles?{params}"
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": (
+                          "Bearer " +
+                          os.environ["OANDA_API_KEY"]
+                      )
+                  },
+              )
+              with urllib.request.urlopen(
+                  request, timeout=40
+              ) as response:
+                  payload = json.load(response)
+
+              candles = [
+                  candle
+                  for candle in payload["candles"]
+                  if candle.get("complete")
+              ]
+              return [
+                  {
+                      "time": c["time"],
+                      "close": float(c["mid"]["c"]),
+                      "open": float(c["mid"]["o"]),
+                  }
+                  for c in candles
+              ]
+
+          def sma(values, period):
+              result = [None] * len(values)
+              rolling = 0.0
+              for i, value in enumerate(values):
+                  rolling += value
+                  if i >= period:
+                      rolling -= values[i - period]
+                  if i >= period - 1:
+                      result[i] = rolling / period
+              return result
+
+          def simulate(bars, short, long):
+              closes = [b["close"] for b in bars]
+              fast = sma(closes, short)
+              slow = sma(closes, long)
+
+              trades = []
+              position = 0
+              entry = None
+              equity = 0.0
+              peak = 0.0
+              drawdown = 0.0
+
+              # Signals use completed candles.
+              # Execution occurs at the next open.
+              for i in range(long, len(bars)):
+                  previous = i - 1
+                  if (
+                      fast[previous] is None
+                      or slow[previous] is None
+                  ):
+                      continue
+
+                  if fast[previous] > slow[previous]:
+                      desired = 1
+                  elif fast[previous] < slow[previous]:
+                      desired = -1
+                  else:
+                      desired = 0
+
+                  if desired == position:
+                      continue
+
+                  price = bars[i]["open"]
+
+                  if position != 0:
+                      pnl = (
+                          (price - entry)
+                          * position / PIP
+                          - COST_PIPS
+                      )
+                      trades.append(pnl)
+                      equity += pnl
+                      peak = max(peak, equity)
+                      drawdown = max(
+                          drawdown, peak - equity
+                      )
+
+                  position = desired
+                  entry = (
+                      price if position != 0
+                      else None
+                  )
+
+              # Force-close remaining position
+              # at the final historical close.
+              if position != 0:
+                  price = closes[-1]
+                  pnl = (
+                      (price - entry)
+                      * position / PIP
+                      - COST_PIPS
+                  )
+                  trades.append(pnl)
+                  equity += pnl
+                  peak = max(peak, equity)
+                  drawdown = max(
+                      drawdown, peak - equity
+                  )
+
+              wins = sum(p > 0 for p in trades)
+              gains = sum(
+                  p for p in trades if p > 0
+              )
+              losses = -sum(
+                  p for p in trades if p < 0
+              )
+
+              return {
+                  "trades": len(trades),
+                  "wins": wins,
+                  "win_rate": (
+                      100 * wins / len(trades)
+                      if trades else 0
+                  ),
+                  "net_pips": sum(trades),
+                  "profit_factor": (
+                      gains / losses
+                      if losses else None
+                  ),
+                  "drawdown": drawdown,
+              }
+
+          def report(pair, short, long, result):
+              print("=" * 46)
+              print("FXBOT SMA HISTORICAL BACKTEST")
+              print("PAIR:", pair)
+              print("TIMEFRAME: H1")
+              print("SMA:", short, "/", long)
+              print("CLOSED TRADES:", result["trades"])
+              print("WINS:", result["wins"])
+              print(
+                  "WIN RATE:",
+                  f'{result["win_rate"]:.2f}%'
+              )
+              print(
+                  "NET PIPS:",
+                  f'{result["net_pips"]:.2f}'
+              )
+              factor = result["profit_factor"]
+              print(
+                  "PROFIT FACTOR:",
+                  f"{factor:.2f}"
+                  if factor is not None else "N/A"
+              )
+              print(
+                  "MAX CLOSED-TRADE DRAWDOWN:",
+                  f'{result["drawdown"]:.2f} pips'
+              )
+              print(
+                  "ESTIMATED ROUND-TRIP COST:",
+                  f"{COST_PIPS} pips/trade"
+              )
+              print("ANALYSIS ONLY - NO ORDERS")
+              print("=" * 46)
+
+          for pair in PAIRS:
+              bars = fetch_candles(pair)
+              if len(bars) < 500:
+                  raise RuntimeError(
+                      f"Insufficient candles: {pair}"
+                  )
+
+              print()
+              print("PAIR:", pair)
+              print("CANDLES:", len(bars))
+              print("FIRST:", bars[0]["time"])
+              print("LAST:", bars[-1]["time"])
+
+              for short, long in SMA_SETTINGS:
+                  result = simulate(
+                      bars, short, long
+                  )
+                  report(pair, short, long, result)
+
+          print()
+          print("SMA comparison completed.")
+          print("No orders were placed.")
+          PY
