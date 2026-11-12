@@ -54,6 +54,7 @@ jobs:
               hostname="api-fxpractice.oanda.com",
               port=443,
               token=os.environ["OANDA_API_KEY"]
+poll_timeout=30
           )
 
           start = pd.Timestamp("2023-01-01", tz="UTC")
