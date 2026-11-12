@@ -1,0 +1,222 @@
+
+name: Forex SMA Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-sma:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate EUR/USD SMA 50/200
+        shell: bash
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime
+
+          PAIR = "EUR_USD"
+          FAST = 50
+          SLOW = 200
+          PIP = 0.0001
+          COST_PIPS = 2.0
+          COUNT = 4999
+          SPLIT = 0.70
+
+          token = os.environ.get("OANDA_API_KEY")
+          if not token:
+              raise RuntimeError("Missing OANDA_API_KEY secret")
+
+          params = urllib.parse.urlencode({
+              "count": COUNT,
+              "granularity": "H1",
+              "price": "M"
+          })
+
+          url = (
+              "https://api-fxpractice.oanda.com"
+              f"/v3/instruments/{PAIR}/candles?{params}"
+          )
+
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept-Datetime-Format": "RFC3339"
+              }
+          )
+
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
+              payload = json.load(response)
+
+          bars = [
+              {
+                  "time": c["time"],
+                  "open": float(c["mid"]["o"]),
+                  "close": float(c["mid"]["c"])
+              }
+              for c in payload["candles"]
+              if c["complete"]
+          ]
+
+          if len(bars) < 1000:
+              raise RuntimeError("Not enough historical candles")
+
+          def moving_average(values, period):
+              result = [None] * len(values)
+              rolling = 0.0
+
+              for i, value in enumerate(values):
+                  rolling += value
+                  if i >= period:
+                      rolling -= values[i - period]
+                  if i >= period - 1:
+                      result[i] = rolling / period
+
+              return result
+
+          closes = [bar["close"] for bar in bars]
+          fast_ma = moving_average(closes, FAST)
+          slow_ma = moving_average(closes, SLOW)
+
+          split_index = int(len(bars) * SPLIT)
+
+          def simulate(start, end):
+              position = 0
+              entry = None
+              trades = []
+              equity = 0.0
+              peak = 0.0
+              max_drawdown = 0.0
+
+              def record(pnl):
+                  nonlocal equity, peak, max_drawdown
+                  trades.append(pnl)
+                  equity += pnl
+                  peak = max(peak, equity)
+                  max_drawdown = max(
+                      max_drawdown, peak - equity
+                  )
+
+              for i in range(max(start, SLOW), end):
+                  previous = i - 1
+
+                  if fast_ma[previous] is None:
+                      continue
+
+                  if fast_ma[previous] > slow_ma[previous]:
+                      desired = 1
+                  elif fast_ma[previous] < slow_ma[previous]:
+                      desired = -1
+                  else:
+                      desired = 0
+
+                  if desired == position:
+                      continue
+
+                  price = bars[i]["open"]
+
+                  if position != 0:
+                      pnl = (
+                          (price - entry) * position / PIP
+                          - COST_PIPS
+                      )
+                      record(pnl)
+
+                  position = desired
+                  entry = price if position else None
+
+              if position != 0:
+                  price = bars[end - 1]["close"]
+                  pnl = (
+                      (price - entry) * position / PIP
+                      - COST_PIPS
+                  )
+                  record(pnl)
+
+              wins = sum(p > 0 for p in trades)
+              gains = sum(p for p in trades if p > 0)
+              losses = -sum(p for p in trades if p < 0)
+
+              return {
+                  "trades": len(trades),
+                  "win_rate": (
+                      100 * wins / len(trades)
+                      if trades else 0.0
+                  ),
+                  "net_pips": sum(trades),
+                  "profit_factor": (
+                      gains / losses if losses else None
+                  ),
+                  "drawdown": max_drawdown
+              }
+
+          def report(label, start, end):
+              result = simulate(start, end)
+
+              print("=" * 48)
+              print(label)
+              print("PAIR:", PAIR)
+              print("TIMEFRAME: H1")
+              print("SMA:", FAST, "/", SLOW)
+              print("FIRST:", bars[start]["time"])
+              print("LAST:", bars[end - 1]["time"])
+              print("CANDLES:", end - start)
+              print("CLOSED TRADES:", result["trades"])
+              print(
+                  "WIN RATE:",
+                  f'{result["win_rate"]:.2f}%'
+              )
+              print(
+                  "NET PIPS:",
+                  f'{result["net_pips"]:.2f}'
+              )
+              factor = result["profit_factor"]
+              print(
+                  "PROFIT FACTOR:",
+                  f"{factor:.2f}"
+                  if factor is not None else "N/A"
+              )
+              print(
+                  "MAX CLOSED-TRADE DRAWDOWN:",
+                  f'{result["drawdown"]:.2f} pips'
+              )
+              print(
+                  "ESTIMATED ROUND-TRIP COST:",
+                  f"{COST_PIPS} pips/trade"
+              )
+              print("ANALYSIS ONLY - NO ORDERS")
+              print("=" * 48)
+
+          print("FXBOT EUR/USD SMA 50/200 VALIDATION")
+          print("TOTAL CANDLES:", len(bars))
+          print("DEVELOPMENT SHARE: 70%")
+          print("VALIDATION SHARE: 30%")
+
+          report(
+              "DEVELOPMENT PERIOD",
+              0,
+              split_index
+          )
+
+          report(
+              "VALIDATION PERIOD",
+              split_index,
+              len(bars)
+          )
+
+          print("Validation completed.")
+          print("No orders were placed.")
+          PY
