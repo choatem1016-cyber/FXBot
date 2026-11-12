@@ -1,0 +1,285 @@
+
+name: FXBot SMA Optimization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  optimize-sma:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout FXBot
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "numpy>=1.23,<2" \
+            "pandas>=1.5,<3" \
+            "v20==3.0.25.0"
+
+      - name: Optimize SMA on historical prices
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import numpy as np
+          import pandas as pd
+          import v20
+
+          api = v20.Context(
+              hostname="api-fxpractice.oanda.com",
+              port=443,
+              token=os.environ["OANDA_API_KEY"],
+              poll_timeout=30
+          )
+
+          start = pd.Timestamp("2022-12-01", tz="UTC")
+          end = pd.Timestamp("2026-01-01", tz="UTC")
+
+          rows = []
+          cursor = start
+
+          print("Downloading historical EUR/USD data...", flush=True)
+
+          while cursor < end:
+              batch_end = min(
+                  cursor + pd.Timedelta(days=7),
+                  end
+              )
+
+              for attempt in range(1, 6):
+                  try:
+                      response = api.instrument.candles(
+                          "EUR_USD",
+                          granularity="H1",
+                          price="M",
+                          fromTime=cursor.isoformat(),
+                          toTime=batch_end.isoformat()
+                      )
+
+                      if response.status in (429, 500, 502, 503, 504):
+                          raise RuntimeError(
+                              f"Temporary OANDA status {response.status}"
+                          )
+
+                      if response.status != 200:
+                          raise ValueError(
+                              f"OANDA status {response.status}"
+                          )
+
+                      break
+
+                  except (v20.errors.V20Timeout, RuntimeError) as exc:
+                      if attempt == 5:
+                          raise
+
+                      print(
+                          f"Retry {attempt}/5: {exc}",
+                          flush=True
+                      )
+                      time.sleep(attempt * 5)
+
+              candles = response.body.get("candles", [])
+
+              for candle in candles:
+                  if candle.complete:
+                      timestamp = pd.Timestamp(candle.time)
+
+                      if start <= timestamp < end:
+                          rows.append(
+                              (
+                                  timestamp,
+                                  float(candle.mid.c)
+                              )
+                          )
+
+              cursor = batch_end
+
+          if not rows:
+              raise RuntimeError("No historical data downloaded")
+
+          prices = (
+              pd.DataFrame(rows, columns=["time", "close"])
+                .drop_duplicates("time")
+                .set_index("time")
+                .sort_index()
+          )
+
+          print("Total candles:", len(prices), flush=True)
+          print("First:", prices.index.min(), flush=True)
+          print("Last:", prices.index.max(), flush=True)
+
+          if prices.index.min() > pd.Timestamp(
+              "2022-12-05", tz="UTC"
+          ):
+              raise RuntimeError("Insufficient warmup data")
+
+          if prices.index.max() < pd.Timestamp(
+              "2025-12-30", tz="UTC"
+          ):
+              raise RuntimeError("Incomplete historical period")
+
+          # Each position change of 1 costs 2 pips.
+          # A direct long-to-short reversal costs 4 pips.
+          # These are approximate costs, not actual fills.
+          COST_PER_UNIT = 0.0002
+
+          combinations = [
+              (10, 50),
+              (20, 100),
+              (20, 200),
+              (30, 150),
+              (50, 200),
+              (100, 300)
+          ]
+
+          log_returns = np.log(
+              prices["close"] /
+              prices["close"].shift(1)
+          ).fillna(0)
+
+          results = []
+
+          def evaluate(short_window, long_window):
+              short_sma = prices["close"].rolling(
+                  short_window
+              ).mean()
+
+              long_sma = prices["close"].rolling(
+                  long_window
+              ).mean()
+
+              valid = long_sma.notna()
+
+              position = pd.Series(
+                  np.where(short_sma > long_sma, 1.0, -1.0),
+                  index=prices.index
+              ).where(valid, 0.0)
+
+              # Use previous completed candle's signal.
+              held_position = position.shift(1).fillna(0.0)
+
+              # Costs occur when positions change.
+              changes = position.diff().abs().fillna(
+                  position.abs()
+              )
+
+              strategy_log = (
+                  held_position * log_returns
+                  - changes * COST_PER_UNIT
+              )
+
+              output = pd.DataFrame({
+                  "strategy": strategy_log,
+                  "changes": changes
+              })
+
+              return output
+
+          def metrics(output, first_year, last_year):
+              begin = pd.Timestamp(
+                  f"{first_year}-01-01", tz="UTC"
+              )
+              finish = pd.Timestamp(
+                  f"{last_year + 1}-01-01", tz="UTC"
+              )
+
+              period = output.loc[
+                  (output.index >= begin) &
+                  (output.index < finish)
+              ].copy()
+
+              if period.empty:
+                  raise RuntimeError("Empty evaluation period")
+
+              equity = np.exp(
+                  period["strategy"].cumsum()
+              )
+
+              equity_with_start = pd.concat([
+                  pd.Series([1.0]),
+                  equity.reset_index(drop=True)
+              ], ignore_index=True)
+
+              drawdown = (
+                  equity_with_start /
+                  equity_with_start.cummax() - 1
+              ).min() * 100
+
+              total_return = (
+                  np.exp(period["strategy"].sum()) - 1
+              ) * 100
+
+              return {
+                  "Return %": round(total_return, 2),
+                  "Max DD %": round(drawdown, 2),
+                  "Position Units": int(
+                      period["changes"].sum()
+                  )
+              }
+
+          for short_window, long_window in combinations:
+              output = evaluate(short_window, long_window)
+
+              training = metrics(output, 2023, 2024)
+              testing = metrics(output, 2025, 2025)
+
+              results.append({
+                  "SMA": f"{short_window}/{long_window}",
+                  "Train Return %": training["Return %"],
+                  "Train Max DD %": training["Max DD %"],
+                  "Train Position Units": training["Position Units"],
+                  "Test Return %": testing["Return %"],
+                  "Test Max DD %": testing["Max DD %"],
+                  "Test Position Units": testing["Position Units"]
+              })
+
+          report = pd.DataFrame(results)
+
+          # Rank exclusively using training data.
+          report = report.sort_values(
+              "Train Return %",
+              ascending=False
+          ).reset_index(drop=True)
+
+          print()
+          print("=" * 78)
+          print("FXBOT SMA OPTIMIZATION")
+          print("=" * 78)
+          print("Pair: EUR/USD | Timeframe: H1")
+          print("Training: 2023-2024")
+          print("Out-of-sample testing: 2025")
+          print("Estimated cost per position unit:", COST_PER_UNIT)
+          print()
+          print(report.to_string(index=False))
+          print()
+          print("BEST TRAINING COMBINATION:")
+          print(report.iloc[0]["SMA"])
+          print()
+          print("2025 TEST RETURN:")
+          print(str(report.iloc[0]["Test Return %"]) + "%")
+          print()
+          print("IMPORTANT:")
+          print("The 2025 data was not used for ranking.")
+          print("Do not choose another combination based on")
+          print("its 2025 result without further testing.")
+          print("Results use midpoint prices and estimated costs.")
+          print("No slippage, leverage, or sizing modeled.")
+          print("NO TRADING ORDERS PLACED")
+          PY
