@@ -1,0 +1,282 @@
+
+name: FXBot Strategy Comparison
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-strategies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout FXBot
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "numpy>=1.23,<2" \
+            "pandas>=1.5,<3" \
+            "matplotlib>=3.6,<4" \
+            "scikit-learn>=1.2,<2" \
+            "pytz>=2022" \
+            "v20==3.0.25.0"
+          python -m pip install ./tpqoa
+
+      - name: Compare original FXBot strategies
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import numpy as np
+          import pandas as pd
+          import v20
+
+          from backtesting.SMABacktest import SMABacktest
+          from backtesting.BollingerBandsBacktest import BollingerBandsBacktest
+          from backtesting.MomentumBacktest import MomentumBacktest
+          from backtesting.ContrarianBacktest import ContrarianBacktest
+
+          api = v20.Context(
+              hostname="api-fxpractice.oanda.com",
+              port=443,
+              token=os.environ["OANDA_API_KEY"]
+          )
+
+          start = pd.Timestamp("2023-01-01", tz="UTC")
+          end = pd.Timestamp("2026-01-01", tz="UTC")
+
+          candles_data = []
+          cursor = start
+
+          print("Downloading EUR/USD historical candles...")
+
+          while cursor < end:
+              batch_end = min(
+                  cursor + pd.Timedelta(days=7),
+                  end
+              )
+
+              response = api.instrument.candles(
+                  "EUR_USD",
+                  granularity="H1",
+                  price="M",
+                  fromTime=cursor.isoformat(),
+                  toTime=batch_end.isoformat()
+              )
+
+              if response.status != 200:
+                  raise RuntimeError(
+                      f"OANDA status: {response.status}"
+                  )
+
+              candles = response.body.get("candles", [])
+
+              for candle in candles:
+                  timestamp = pd.Timestamp(candle.time)
+
+                  if (
+                      start <= timestamp < end
+                      and candle.complete
+                  ):
+                      candles_data.append(
+                          (timestamp, float(candle.mid.c))
+                      )
+
+              cursor = batch_end
+
+          if not candles_data:
+              raise RuntimeError(
+                  "No historical candles downloaded"
+              )
+
+          prices = pd.DataFrame(
+              candles_data,
+              columns=["time", "price"]
+          )
+
+          prices = (
+              prices.drop_duplicates("time")
+                    .set_index("time")
+                    .sort_index()
+          )
+
+          prices["returns"] = np.log(
+              prices["price"] /
+              prices["price"].shift(1)
+          )
+
+          print("Total candles:", len(prices))
+          print("First candle:", prices.index.min())
+          print("Last candle:", prices.index.max())
+
+          # Approximate trading cost per unit
+          # of position change, in log-return terms.
+          trading_cost = 0.0002
+
+          class SafeSMA(SMABacktest):
+              def acquire_data(self):
+                  return self.input_prices.copy()
+
+          class SafeBollinger(BollingerBandsBacktest):
+              def acquire_data(self):
+                  return self.input_prices.copy()
+
+          class SafeMomentum(MomentumBacktest):
+              def acquire_data(self):
+                  return self.input_prices.copy()
+
+          class SafeContrarian(ContrarianBacktest):
+              def acquire_data(self):
+                  return self.input_prices.copy()
+
+          # Provide each subclass its own input data
+          # before the original initializer runs.
+          def make_safe_class(original_class):
+              class Safe(original_class):
+                  input_prices = None
+
+                  def acquire_data(self):
+                      return self.input_prices.copy()
+
+              return Safe
+
+          strategies = [
+              (
+                  "SMA 50/200",
+                  make_safe_class(SMABacktest),
+                  {"smas": 50, "smal": 200}
+              ),
+              (
+                  "Bollinger 20/2",
+                  make_safe_class(BollingerBandsBacktest),
+                  {"sma": 20, "deviation": 2}
+              ),
+              (
+                  "Momentum 10",
+                  make_safe_class(MomentumBacktest),
+                  {"window": 10}
+              ),
+              (
+                  "Contrarian 10",
+                  make_safe_class(ContrarianBacktest),
+                  {"window": 10}
+              )
+          ]
+
+          summary = []
+
+          for year in [2023, 2024, 2025]:
+              # Use prior candles for indicator
+              # warm-up without counting their returns.
+              year_start = pd.Timestamp(
+                  f"{year}-01-01", tz="UTC"
+              )
+              year_end = pd.Timestamp(
+                  f"{year + 1}-01-01", tz="UTC"
+              )
+
+              warmup_start = year_start - pd.Timedelta(
+                  days=21
+              )
+
+              year_prices = prices.loc[
+                  (prices.index >= warmup_start) &
+                  (prices.index < year_end)
+              ].copy()
+
+              if year_prices.empty:
+                  raise RuntimeError(
+                      f"No prices for {year}"
+                  )
+
+              for name, cls, parameters in strategies:
+                  cls.input_prices = year_prices
+
+                  tester = cls(
+                      instrument="EUR_USD",
+                      start=str(warmup_start.date()),
+                      end=str(year_end.date()),
+                      granularity="H1",
+                      trading_cost=trading_cost,
+                      **parameters
+                  )
+
+                  tester.test(mute=True)
+                  results = tester.get_results()
+
+                  # Report only the requested year.
+                  r = results.loc[
+                      (results.index >= year_start) &
+                      (results.index < year_end)
+                  ].copy()
+
+                  if r.empty:
+                      raise RuntimeError(
+                          f"No results: {name}, {year}"
+                      )
+
+                  # Sum period log returns so each
+                  # year's performance resets correctly.
+                  log_returns = r["strategy"].sum()
+                  strategy_return = (
+                      np.exp(log_returns) - 1
+                  ) * 100
+
+                  equity = np.exp(
+                      r["strategy"].cumsum()
+                  )
+                  peak = equity.cummax()
+                  drawdown = (
+                      equity / peak - 1
+                  ) * 100
+
+                  max_drawdown = drawdown.min()
+                  position_changes = r["trades"].sum()
+
+                  summary.append({
+                      "Year": year,
+                      "Strategy": name,
+                      "Return %": round(
+                          strategy_return, 2
+                      ),
+                      "Max DD %": round(
+                          max_drawdown, 2
+                      ),
+                      "Position Units": int(
+                          position_changes
+                      )
+                  })
+
+          report = pd.DataFrame(summary)
+
+          print()
+          print("=" * 75)
+          print("FXBOT ORIGINAL STRATEGY COMPARISON")
+          print("=" * 75)
+          print("Pair: EUR/USD")
+          print("Timeframe: H1")
+          print("Years: 2023, 2024, 2025")
+          print("Cost per position unit:", trading_cost)
+          print()
+          print(report.to_string(index=False))
+          print()
+          print("IMPORTANT:")
+          print("Returns are historical estimates.")
+          print("Trading costs are approximate.")
+          print("No leverage or position sizing modeled.")
+          print("NO TRADING ORDERS PLACED")
+          PY
