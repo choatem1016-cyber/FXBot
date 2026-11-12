@@ -76,7 +76,7 @@ jobs:
                       f"Historical data request failed: {response.status}"
                   )
 
-              candles = response.get("candles", [])
+              candles = response.body.get("candles", [])
               if not candles:
                   break
 
