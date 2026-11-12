@@ -15,6 +15,10 @@ from backtesting.MLClassificationBacktest import MLClassificationBacktest
 
 
 if __name__ == "__main__":
+    raise SystemExit(
+        "SAFETY LOCK: FXBot is restricted to historical "
+        "backtesting. Live and practice trading are disabled."
+    )
 
     while True:
 
