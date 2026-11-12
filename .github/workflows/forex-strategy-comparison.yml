@@ -72,6 +72,8 @@ jobs:
                   end
               )
 
+              response = None
+
               for attempt in range(1, 6):
                   try:
                       response = api.instrument.candles(
@@ -82,22 +84,40 @@ jobs:
                           toTime=batch_end.isoformat()
                       )
 
-                      if response.status != 200:
+                      if response.status in (
+                          429, 500, 502, 503, 504
+                      ):
                           raise RuntimeError(
-                              f"OANDA status {response.status}"
+                              f"Temporary OANDA status "
+                              f"{response.status}"
+                          )
+
+                      if response.status != 200:
+                          raise ValueError(
+                              f"OANDA returned status "
+                              f"{response.status}"
                           )
 
                       break
 
-                  except v20.errors.V20Timeout:
+                  except (
+                      v20.errors.V20Timeout,
+                      RuntimeError
+                  ) as error:
                       if attempt == 5:
                           raise
+
                       print(
-                          f"Timeout. Retrying batch "
-                          f"{cursor.date()} "
-                          f"(attempt {attempt}/5)"
+                          f"Request failed: {error}. "
+                          f"Retrying attempt {attempt}/5"
                       )
-                      time.sleep(attempt * 2)
+
+                      time.sleep(attempt * 5)
+
+              if response is None:
+                  raise RuntimeError(
+                      "No OANDA response received"
+                  )
 
               candles = response.body.get("candles", [])
 
@@ -109,7 +129,10 @@ jobs:
                       and candle.complete
                   ):
                       candles_data.append(
-                          (timestamp, float(candle.mid.c))
+                          (
+                              timestamp,
+                              float(candle.mid.c)
+                          )
                       )
 
               print(
@@ -141,7 +164,8 @@ jobs:
           )
 
           prices["returns"] = np.log(
-              prices["price"] / prices["price"].shift(1)
+              prices["price"] /
+              prices["price"].shift(1)
           )
 
           print("Total candles:", len(prices))
@@ -186,20 +210,29 @@ jobs:
 
           for year in [2023, 2024, 2025]:
               year_start = pd.Timestamp(
-                  f"{year}-01-01", tz="UTC"
-              )
-              year_end = pd.Timestamp(
-                  f"{year + 1}-01-01", tz="UTC"
+                  f"{year}-01-01",
+                  tz="UTC"
               )
 
-              warmup_start = year_start - pd.Timedelta(
-                  days=21
+              year_end = pd.Timestamp(
+                  f"{year + 1}-01-01",
+                  tz="UTC"
+              )
+
+              warmup_start = (
+                  year_start -
+                  pd.Timedelta(days=21)
               )
 
               year_prices = prices.loc[
                   (prices.index >= warmup_start) &
                   (prices.index < year_end)
               ].copy()
+
+              if year_prices.empty:
+                  raise RuntimeError(
+                      f"No prices for {year}"
+                  )
 
               for name, cls, parameters in strategies:
                   cls.input_prices = year_prices
@@ -223,11 +256,14 @@ jobs:
 
                   if r.empty:
                       raise RuntimeError(
-                          f"No results for {name} in {year}"
+                          f"No results for "
+                          f"{name} in {year}"
                       )
 
                   strategy_return = (
-                      np.exp(r["strategy"].sum()) - 1
+                      np.exp(
+                          r["strategy"].sum()
+                      ) - 1
                   ) * 100
 
                   equity = np.exp(
@@ -235,7 +271,8 @@ jobs:
                   )
 
                   max_drawdown = (
-                      equity / equity.cummax() - 1
+                      equity /
+                      equity.cummax() - 1
                   ).min() * 100
 
                   position_units = int(
@@ -263,9 +300,14 @@ jobs:
           print("Pair: EUR/USD")
           print("Timeframe: H1")
           print("Years: 2023, 2024, 2025")
-          print("Trading cost per position unit:", trading_cost)
+          print(
+              "Trading cost per position unit:",
+              trading_cost
+          )
           print()
-          print(report.to_string(index=False))
+          print(
+              report.to_string(index=False)
+          )
           print()
           print("Historical backtesting only.")
           print("Trading costs are approximate.")
