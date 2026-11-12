@@ -1,0 +1,283 @@
+
+name: Forex Multi-Year Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  multiyear-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Run five-year SMA backtest
+        shell: bash
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import time
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime, timezone, timedelta
+
+          PAIR = "EUR_USD"
+          FAST = 50
+          SLOW = 200
+          PIP = 0.0001
+          COST = 2.0
+
+          START = datetime(2021, 1, 1, tzinfo=timezone.utc)
+          END = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+          token = os.environ.get("OANDA_API_KEY")
+          if not token:
+              raise RuntimeError("Missing OANDA_API_KEY")
+
+          def iso(dt):
+              return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          def fetch(start, end):
+              params = urllib.parse.urlencode({
+                  "from": iso(start),
+                  "to": iso(end),
+                  "granularity": "H1",
+                  "price": "M"
+              })
+
+              url = (
+                  "https://api-fxpractice.oanda.com"
+                  f"/v3/instruments/{PAIR}/candles?{params}"
+              )
+
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}"
+                  }
+              )
+
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(
+                          req, timeout=30
+                      ) as response:
+                          data = json.load(response)
+
+                      return [
+                          {
+                              "time": c["time"],
+                              "open": float(c["mid"]["o"]),
+                              "close": float(c["mid"]["c"])
+                          }
+                          for c in data["candles"]
+                          if c["complete"]
+                      ]
+
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                      time.sleep(2 ** attempt)
+
+          print("Downloading historical EUR/USD candles")
+
+          unique = {}
+          cursor = START
+
+          while cursor < END:
+              next_date = min(
+                  cursor + timedelta(days=14),
+                  END
+              )
+
+              for bar in fetch(cursor, next_date):
+                  unique[bar["time"]] = bar
+
+              cursor = next_date
+              time.sleep(0.05)
+
+          bars = [
+              unique[t] for t in sorted(unique)
+          ]
+
+          print("CANDLES:", len(bars))
+
+          if len(bars) < 10000:
+              raise RuntimeError("Insufficient history")
+
+          closes = [b["close"] for b in bars]
+
+          def sma(values, period):
+              result = [None] * len(values)
+              total = 0.0
+
+              for i, value in enumerate(values):
+                  total += value
+
+                  if i >= period:
+                      total -= values[i - period]
+
+                  if i >= period - 1:
+                      result[i] = total / period
+
+              return result
+
+          fast = sma(closes, FAST)
+          slow = sma(closes, SLOW)
+
+          def test(start, end):
+              position = 0
+              entry = None
+              trades = []
+              equity = 0.0
+              peak = 0.0
+              drawdown = 0.0
+
+              def close_trade(price):
+                  nonlocal equity, peak, drawdown
+
+                  pnl = (
+                      (price - entry) * position / PIP
+                      - COST
+                  )
+
+                  trades.append(pnl)
+                  equity += pnl
+                  peak = max(peak, equity)
+                  drawdown = max(
+                      drawdown, peak - equity
+                  )
+
+              for i in range(max(start, SLOW), end):
+                  prev = i - 1
+
+                  if fast[prev] is None:
+                      continue
+
+                  if fast[prev] > slow[prev]:
+                      desired = 1
+                  elif fast[prev] < slow[prev]:
+                      desired = -1
+                  else:
+                      desired = 0
+
+                  if desired == position:
+                      continue
+
+                  price = bars[i]["open"]
+
+                  if position != 0:
+                      close_trade(price)
+
+                  position = desired
+                  entry = price if position else None
+
+              if position != 0:
+                  close_trade(bars[end - 1]["close"])
+
+              wins = sum(p > 0 for p in trades)
+              gains = sum(p for p in trades if p > 0)
+              losses = -sum(p for p in trades if p < 0)
+
+              return {
+                  "trades": len(trades),
+                  "wins": wins,
+                  "win_rate": (
+                      100 * wins / len(trades)
+                      if trades else 0
+                  ),
+                  "net": sum(trades),
+                  "pf": (
+                      gains / losses if losses else None
+                  ),
+                  "drawdown": drawdown
+              }
+
+          def index_for(year):
+              target = f"{year}-01-01"
+
+              for i, bar in enumerate(bars):
+                  if bar["time"][:10] >= target:
+                      return i
+
+              return len(bars)
+
+          def report(label, start, end):
+              result = test(start, end)
+
+              print("=" * 45)
+              print(label)
+              print("PAIR:", PAIR)
+              print("TIMEFRAME: H1")
+              print("SMA:", FAST, "/", SLOW)
+              print("CANDLES:", end - start)
+              print("TRADES:", result["trades"])
+              print("WINS:", result["wins"])
+              print(
+                  "WIN RATE:",
+                  f'{result["win_rate"]:.2f}%'
+              )
+              print(
+                  "NET PIPS:",
+                  f'{result["net"]:.2f}'
+              )
+
+              pf = result["pf"]
+              print(
+                  "PROFIT FACTOR:",
+                  f"{pf:.2f}" if pf is not None else "N/A"
+              )
+              print(
+                  "MAX CLOSED-TRADE DRAWDOWN:",
+                  f'{result["drawdown"]:.2f}'
+              )
+              print("COST:", COST, "pips/trade")
+              print("=" * 45)
+
+              return result
+
+          print("FXBOT FIVE-YEAR HISTORICAL BACKTEST")
+          print("2021-2025")
+          print("SIMULATION ONLY - NO ORDERS")
+
+          yearly = []
+
+          for year in range(2021, 2026):
+              start = index_for(year)
+              end = index_for(year + 1)
+
+              result = report(
+                  f"YEAR {year}", start, end
+              )
+
+              yearly.append((year, result))
+
+          print("=" * 45)
+          print("ANNUAL SUMMARY")
+
+          for year, result in yearly:
+              print(
+                  year,
+                  "TRADES:", result["trades"],
+                  "NET PIPS:",
+                  f'{result["net"]:.2f}'
+              )
+
+          print("=" * 45)
+          print("DEVELOPMENT YEARS: 2021-2024")
+          print("LATER EVALUATION YEAR: 2025")
+          print(
+              "Annual results reset positions "
+              "at each year boundary."
+          )
+          print(
+              "Results are historical simulations, "
+              "not predictions."
+          )
+          print("NO ORDERS WERE PLACED")
+          PY
