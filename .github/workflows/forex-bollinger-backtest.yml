@@ -74,8 +74,8 @@ jobs:
                   granularity="H1",
                   price="M",
                   **{
-                      "from": cursor.isoformat(),
-                      "to": batch_end.isoformat()
+                      "from":  Time=cursor.isoformat(),
+                      "to": Time=batch_end.isoformat()
                   }
               )
 
