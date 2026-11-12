@@ -35,7 +35,7 @@ jobs:
             "v20==3.0.25.0"
           python -m pip install ./tpqoa
 
-      - name: Run original Bollinger Bands backtest
+      - name: Run Bollinger Bands backtest
         env:
           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         run: |
@@ -65,7 +65,7 @@ jobs:
 
           while cursor < end:
               batch_end = min(
-                  cursor + pd.Timedelta(days=30),
+                  cursor + pd.Timedelta(days=7),
                   end
               )
 
@@ -73,10 +73,8 @@ jobs:
                   "EUR_USD",
                   granularity="H1",
                   price="M",
-                  **{
-                      fromTime=cursor.isoformat(),
-                      toTime=batch_end.isoformat()
-                  }
+                  fromTime=cursor.isoformat(),
+                  toTime=batch_end.isoformat()
               )
 
               if response.status != 200:
@@ -85,11 +83,6 @@ jobs:
                   )
 
               candles = response.body.get("candles", [])
-
-              if not candles:
-                  print("No candles in this batch")
-                  cursor = batch_end
-                  continue
 
               for candle in candles:
                   timestamp = pd.Timestamp(candle.time)
@@ -106,12 +99,13 @@ jobs:
                       )
 
               print(
-                  "Downloaded batch:",
+                  "Batch:",
                   cursor.date(),
                   "to",
                   batch_end.date(),
-                  "candles:",
-                  len(candles)
+                  "-",
+                  len(candles),
+                  "candles"
               )
 
               cursor = batch_end
@@ -136,6 +130,10 @@ jobs:
               df["price"] / df["price"].shift(1)
           )
 
+          print("Total candles:", len(df))
+          print("First candle:", df.index.min())
+          print("Last candle:", df.index.max())
+
           class SafeBollingerBacktest(BollingerBandsBacktest):
               def acquire_data(self):
                   return df.copy()
@@ -151,7 +149,6 @@ jobs:
           )
 
           performance, comparison = tester.test()
-
           results = tester.get_results()
 
           print()
