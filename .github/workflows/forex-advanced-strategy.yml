@@ -1,0 +1,376 @@
+
+name: FXBot Advanced Strategy Testing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pandas>=2,<3" "numpy>=1.26,<3" "requests>=2.31,<3"
+
+      - name: Run historical EURUSD strategy tests
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import numpy as np
+          import pandas as pd
+          import requests
+
+          token = os.environ.get("OANDA_API_KEY")
+          if not token:
+              raise RuntimeError("Missing OANDA_API_KEY secret")
+
+          session = requests.Session()
+          session.headers.update({
+              "Authorization": "Bearer " + token
+          })
+
+          url = (
+              "https://api-fxpractice.oanda.com"
+              "/v3/instruments/EUR_USD/candles"
+          )
+
+          cursor = pd.Timestamp("2022-11-01", tz="UTC")
+          end = pd.Timestamp("2026-01-01", tz="UTC")
+          rows = []
+
+          print("Downloading historical EUR/USD H1 candles")
+
+          while cursor < end:
+              stop = min(
+                  cursor + pd.Timedelta(days=7),
+                  end
+              )
+
+              params = {
+                  "granularity": "H1",
+                  "price": "M",
+                  "from": cursor.isoformat(),
+                  "to": stop.isoformat()
+              }
+
+              for attempt in range(5):
+                  try:
+                      response = session.get(
+                          url,
+                          params=params,
+                          timeout=35
+                      )
+
+                      if response.status_code in (
+                          429, 500, 502, 503, 504
+                      ):
+                          raise requests.RequestException(
+                              "Temporary HTTP "
+                              + str(response.status_code)
+                          )
+
+                      response.raise_for_status()
+                      payload = response.json()
+                      break
+
+                  except requests.RequestException as exc:
+                      if attempt == 4:
+                          raise
+                      print("Retry:", exc)
+                      time.sleep(3 * (attempt + 1))
+
+              for candle in payload.get("candles", []):
+                  if not candle.get("complete"):
+                      continue
+
+                  mid = candle.get("mid")
+                  if not mid:
+                      continue
+
+                  rows.append((
+                      pd.Timestamp(candle["time"]),
+                      float(mid["o"]),
+                      float(mid["h"]),
+                      float(mid["l"]),
+                      float(mid["c"])
+                  ))
+
+              cursor = stop
+
+          if not rows:
+              raise RuntimeError("No historical candles returned")
+
+          df = pd.DataFrame(
+              rows,
+              columns=[
+                  "time", "open", "high",
+                  "low", "close"
+              ]
+          )
+
+          df = (
+              df.drop_duplicates("time")
+                .set_index("time")
+                .sort_index()
+          )
+
+          print("Candles downloaded:", len(df))
+          print("First candle:", df.index.min())
+          print("Last candle:", df.index.max())
+
+          if len(df) < 15000:
+              raise RuntimeError(
+                  "Insufficient historical candle data"
+              )
+
+          if df.index.max() < pd.Timestamp(
+              "2025-12-30", tz="UTC"
+          ):
+              raise RuntimeError(
+                  "Historical data ends too early"
+              )
+
+          prices = df[
+              ["open", "high", "low", "close"]
+          ]
+
+          if not np.isfinite(prices.to_numpy()).all():
+              raise RuntimeError("Invalid numeric prices")
+
+          if (prices <= 0).any().any():
+              raise RuntimeError("Nonpositive prices")
+
+          invalid_ohlc = (
+              (df.high < df[["open", "close"]].max(axis=1))
+              |
+              (df.low > df[["open", "close"]].min(axis=1))
+          )
+
+          if invalid_ohlc.any():
+              raise RuntimeError("Invalid OHLC candles")
+
+          print("Historical candle validation passed")
+
+          previous_close = df.close.shift(1)
+
+          true_range = pd.concat([
+              df.high - df.low,
+              (df.high - previous_close).abs(),
+              (df.low - previous_close).abs()
+          ], axis=1).max(axis=1)
+
+          atr = (
+              true_range.rolling(14).mean()
+              / df.close
+          )
+
+          atr_threshold = (
+              atr.shift(1)
+                 .rolling(720, min_periods=300)
+                 .median()
+          )
+
+          high_volatility = atr > atr_threshold
+
+          ema50 = df.close.ewm(
+              span=50,
+              adjust=False
+          ).mean()
+
+          ema200 = df.close.ewm(
+              span=200,
+              adjust=False
+          ).mean()
+
+          trend = pd.Series(
+              np.where(ema50 > ema200, 1.0, -1.0),
+              index=df.index
+          )
+
+          prior_high = (
+              df.high.shift(1)
+                     .rolling(24)
+                     .max()
+          )
+
+          prior_low = (
+              df.low.shift(1)
+                    .rolling(24)
+                    .min()
+          )
+
+          breakout = pd.Series(
+              0.0,
+              index=df.index
+          )
+
+          breakout.loc[
+              (df.close > prior_high)
+              & (trend > 0)
+          ] = 1.0
+
+          breakout.loc[
+              (df.close < prior_low)
+              & (trend < 0)
+          ] = -1.0
+
+          strategies = {
+              "EMA 50/200 baseline": trend,
+              "EMA with ATR filter": trend.where(
+                  high_volatility, 0.0
+              ),
+              "24h breakout with ATR": breakout.where(
+                  high_volatility, 0.0
+              )
+          }
+
+          log_returns = np.log(
+              df.close / df.close.shift(1)
+          ).fillna(0.0)
+
+          def evaluate(signal, start, finish):
+              signal = signal.fillna(0.0)
+
+              signal = signal.where(
+                  df.index >= pd.Timestamp(
+                      "2023-01-01", tz="UTC"
+                  ),
+                  0.0
+              )
+
+              held = signal.shift(1).fillna(0.0)
+
+              turnover = (
+                  held.diff()
+                      .abs()
+                      .fillna(held.abs())
+              )
+
+              # Estimated transaction cost:
+              # 2 pips per position unit changed.
+              # A reversal counts as two units.
+              cost = turnover * (
+                  0.0002 / df.close
+              )
+
+              net_returns = (
+                  held * log_returns - cost
+              )
+
+              mask = (
+                  (df.index >= pd.Timestamp(
+                      start, tz="UTC"
+                  ))
+                  &
+                  (df.index < pd.Timestamp(
+                      finish, tz="UTC"
+                  ))
+              )
+
+              selected = net_returns.loc[mask]
+
+              equity = np.exp(selected.cumsum())
+
+              equity = pd.concat([
+                  pd.Series([1.0]),
+                  equity.reset_index(drop=True)
+              ], ignore_index=True)
+
+              total_return = (
+                  np.exp(selected.sum()) - 1
+              ) * 100
+
+              max_drawdown = (
+                  equity / equity.cummax() - 1
+              ).min() * 100
+
+              position_units = int(
+                  turnover.loc[mask].sum()
+              )
+
+              return (
+                  round(total_return, 2),
+                  round(max_drawdown, 2),
+                  position_units
+              )
+
+          print()
+          print("=" * 65)
+          print("FXBOT ADVANCED HISTORICAL STRATEGY TEST")
+          print("=" * 65)
+          print("Instrument: EUR/USD")
+          print("Timeframe: H1")
+          print("Development: 2023-2024")
+          print("Holdout evaluation: 2025")
+          print("Estimated costs: 2 pips per turnover unit")
+          print()
+
+          results = []
+
+          for name, signal in strategies.items():
+              development = evaluate(
+                  signal,
+                  "2023-01-01",
+                  "2025-01-01"
+              )
+
+              holdout = evaluate(
+                  signal,
+                  "2025-01-01",
+                  "2026-01-01"
+              )
+
+              results.append({
+                  "Strategy": name,
+                  "Development Return %": development[0],
+                  "Development Max DD %": development[1],
+                  "2025 Return %": holdout[0],
+                  "2025 Max DD %": holdout[1],
+                  "2025 Position Units": holdout[2]
+              })
+
+          report = pd.DataFrame(results)
+
+          print(report.to_string(index=False))
+
+          report.to_csv(
+              "advanced_strategy_results.csv",
+              index=False
+          )
+
+          print()
+          print("IMPORTANT LIMITATIONS:")
+          print("- Historical midpoint candles only")
+          print("- Approximate transaction costs")
+          print("- No slippage or financing modeled")
+          print("- No leverage or position sizing modeled")
+          print("- 2025 is not a pristine unseen test")
+          print("  because earlier tests used 2025 data")
+          print("- Results do not prove future profitability")
+          print()
+          print("NO LIVE OR PRACTICE ORDERS PLACED")
+          PY
+
+      - name: Upload strategy results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbot-advanced-strategy-results
+          path: advanced_strategy_results.csv
+          if-no-files-found: error
