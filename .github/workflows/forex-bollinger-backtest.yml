@@ -49,59 +49,77 @@ jobs:
 
           token = os.environ["OANDA_API_KEY"]
 
-          # Historical prices only; no order endpoints.
           api = v20.Context(
               hostname="api-fxpractice.oanda.com",
               port=443,
               token=token
           )
 
-          all_candles = []
           start = pd.Timestamp("2025-01-01", tz="UTC")
           end = pd.Timestamp("2026-01-01", tz="UTC")
 
+          all_candles = []
           cursor = start
 
+          print("Downloading EUR/USD H1 historical data...")
+
           while cursor < end:
+              batch_end = min(
+                  cursor + pd.Timedelta(days=30),
+                  end
+              )
+
               response = api.instrument.candles(
                   "EUR_USD",
                   granularity="H1",
                   price="M",
-                  count=5000,
-                  **{"from": cursor.isoformat()}
+                  **{
+                      "from": cursor.isoformat(),
+                      "to": batch_end.isoformat()
+                  }
               )
 
               if response.status != 200:
                   raise RuntimeError(
-                      f"Historical data request failed: {response.status}"
+                      f"OANDA returned status {response.status}"
                   )
 
               candles = response.body.get("candles", [])
-              if not candles:
-                  break
 
-              last_time = None
+              if not candles:
+                  print("No candles in this batch")
+                  cursor = batch_end
+                  continue
 
               for candle in candles:
-                  time = pd.Timestamp(candle.time)
+                  timestamp = pd.Timestamp(candle.time)
 
-                  if time >= end:
-                      break
-
-                  if time >= start and candle.complete:
+                  if (
+                      start <= timestamp < end
+                      and candle.complete
+                  ):
                       all_candles.append(
-                          (time, float(candle.mid.c))
+                          (
+                              timestamp,
+                              float(candle.mid.c)
+                          )
                       )
 
-                  last_time = time
+              print(
+                  "Downloaded batch:",
+                  cursor.date(),
+                  "to",
+                  batch_end.date(),
+                  "candles:",
+                  len(candles)
+              )
 
-              if last_time is None or last_time <= cursor:
-                  break
-
-              cursor = last_time + pd.Timedelta(seconds=1)
+              cursor = batch_end
 
           if not all_candles:
-              raise RuntimeError("No historical candles downloaded")
+              raise RuntimeError(
+                  "No historical candles downloaded"
+              )
 
           df = pd.DataFrame(
               all_candles,
@@ -118,8 +136,6 @@ jobs:
               df["price"] / df["price"].shift(1)
           )
 
-          # Reuse the creator's original strategy.
-          # Override only its data-download method.
           class SafeBollingerBacktest(BollingerBandsBacktest):
               def acquire_data(self):
                   return df.copy()
@@ -135,21 +151,23 @@ jobs:
           )
 
           performance, comparison = tester.test()
+
           results = tester.get_results()
 
-          position_changes = results["trades"].sum()
-
           print()
-          print("===================================")
+          print("====================================")
           print("FXBOT ORIGINAL BOLLINGER BACKTEST")
-          print("===================================")
+          print("====================================")
           print("Pair: EUR/USD")
           print("Period: 2025")
           print("Timeframe: H1")
           print("SMA: 20")
           print("Deviation: 2")
-          print("Candles:", len(df))
-          print("Position changes:", position_changes)
+          print("Historical candles:", len(df))
+          print(
+              "Position-change units:",
+              results["trades"].sum()
+          )
           print(
               "Strategy return:",
               round((performance - 1) * 100, 2),
@@ -160,5 +178,5 @@ jobs:
               round(comparison * 100, 2),
               "percentage points"
           )
-          print("NO ORDERS PLACED")
+          print("NO TRADING ORDERS PLACED")
           PY
